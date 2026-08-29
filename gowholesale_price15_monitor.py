@@ -74,13 +74,26 @@ def alert_key(sku: str, price: float) -> str:
 
 
 def lowest_ask(source: dict) -> float | None:
-    """Extract the lowest ask from the price object. Returns None if absent."""
+    """
+    Extract the lowest ask from the price object.
+    GoWholesale's API returns price keyed by country, e.g. {"US": 15}
+    or {"US": 119, "CA": 164.27}. Prefer the US price; fall back to
+    the lowest of any country's price. Returns None if absent.
+    """
     price = source.get("price") or {}
+    if not isinstance(price, dict):
+        try:
+            return float(price)
+        except (TypeError, ValueError):
+            return None
+    us = price.get("US")
+    if us is not None:
+        try:
+            return float(us)
+        except (TypeError, ValueError):
+            pass
     candidates = []
-    for field in ("ask", "min_price"):
-        val = price.get(field)
-        if val is None:
-            continue
+    for val in price.values():
         try:
             candidates.append(float(val))
         except (TypeError, ValueError):
