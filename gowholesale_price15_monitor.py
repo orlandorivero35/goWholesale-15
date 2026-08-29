@@ -61,7 +61,7 @@ PAYLOAD = {
             }
         }
     },
-    "_source": ["name", "sku", "url_key", "stock", "created_at", "price"],
+    "_source": ["name", "sku", "url_key", "stock", "created_at", "price", "msrp"],
 }
 
 # Alert key = sku + price, so a repriced item can trigger again
@@ -73,27 +73,28 @@ def alert_key(sku: str, price: float) -> str:
     return hashlib.md5(f"{sku.strip().lower()}|{price:.2f}".encode()).hexdigest()
 
 
-def lowest_ask(source: dict) -> float | None:
+def country_amount(source: dict, field: str) -> float | None:
     """
-    Extract the lowest ask from the price object.
-    GoWholesale's API returns price keyed by country, e.g. {"US": 15}
-    or {"US": 119, "CA": 164.27}. Prefer the US price; fall back to
-    the lowest of any country's price. Returns None if absent.
+    Extract a dollar amount from a country-keyed field.
+    GoWholesale's API returns e.g. price={"US": 15} and
+    msrp={"US": 29.99}, sometimes with other countries like
+    {"US": 119, "CA": 164.27}. Prefer the US value; fall back to
+    the lowest of any country's value. Returns None if absent.
     """
-    price = source.get("price") or {}
-    if not isinstance(price, dict):
+    value = source.get(field) or {}
+    if not isinstance(value, dict):
         try:
-            return float(price)
+            return float(value)
         except (TypeError, ValueError):
             return None
-    us = price.get("US")
+    us = value.get("US")
     if us is not None:
         try:
             return float(us)
         except (TypeError, ValueError):
             pass
     candidates = []
-    for val in price.values():
+    for val in value.values():
         try:
             candidates.append(float(val))
         except (TypeError, ValueError):
@@ -101,13 +102,19 @@ def lowest_ask(source: dict) -> float | None:
     return min(candidates) if candidates else None
 
 
+def lowest_ask(source: dict) -> float | None:
+    return country_amount(source, "price")
+
+
 def is_target_price(price: float) -> bool:
     """Exactly $15.00 (penny-safe float comparison)."""
     return abs(price - TARGET_PRICE) < 0.005
 
 
-def send_notification(name: str, price: float, url: str, qty) -> None:
+def send_notification(name: str, price: float, url: str, qty, msrp: float | None) -> None:
     msg = f"{name}\nLowest ask: ${price:.2f}"
+    if msrp:
+        msg += f"\nMSRP: ${msrp:,.2f} ({price / msrp * 100:.0f}% of MSRP)"
     if qty not in (None, ""):
         msg += f"\nQty: {qty}"
     data = {
@@ -140,7 +147,8 @@ def fetch_listings() -> list[dict]:
             url     = f"https://gowholesale.com/p/{url_key}" if url_key else "https://gowholesale.com/search?in-stock=0&sort=newestListings"
             qty     = (source.get("stock") or {}).get("qty", "")
             price   = lowest_ask(source)
-            listings.append({"sku": sku, "name": name, "url": url, "qty": qty, "price": price})
+            msrp    = country_amount(source, "msrp")
+            listings.append({"sku": sku, "name": name, "url": url, "qty": qty, "price": price, "msrp": msrp})
         return listings
     except Exception as e:
         log.error(f"API error: {e}")
@@ -170,7 +178,7 @@ def check_once() -> None:
             continue
 
         try:
-            send_notification(item["name"], price, item["url"], item["qty"])
+            send_notification(item["name"], price, item["url"], item["qty"], item["msrp"])
             alerted.add(key)
         except Exception as e:
             log.error(f"Notification failed: {e}")
