@@ -11,9 +11,14 @@ Environment variables in Render:
   TARGET_PRICES        - comma-separated prices to flag (default: 13,14,15)
   TARGET_PRICE         - old single-price setting, used only if TARGET_PRICES is not set
   CHECK_INTERVAL       - seconds between checks (default: 10, minimum 1)
-  ALERT_ON_FIRST_RUN   - "1" (default) alerts on matching items already on the
-                         page at startup; "0" seeds them silently
+  ALERT_ON_FIRST_RUN   - "0" (default) stays quiet about matching items already on
+                         the page at startup, so restarts never re-send old alerts;
+                         "1" alerts on them
   LOG_PRICES           - "1" logs every listing's price each check (for verifying)
+  BACK_IN_STOCK_MINUTES - if a matching item disappears (sells out) for at least this
+                         long and then shows up again, you get a "back in stock"
+                         alert (default: 60). Shorter gaps are treated as the same
+                         listing and never re-alert.
 """
 
 import os
@@ -89,8 +94,9 @@ if not TARGET_PRICES:
     TARGET_PRICES = {13.0, 14.0, 15.0}
 
 CHECK_INTERVAL     = env_int("CHECK_INTERVAL", 10, 1)
-ALERT_ON_FIRST_RUN = env_flag("ALERT_ON_FIRST_RUN", "1")
+ALERT_ON_FIRST_RUN = env_flag("ALERT_ON_FIRST_RUN", "0")
 LOG_PRICES         = env_flag("LOG_PRICES")
+BACK_IN_STOCK_GAP  = env_int("BACK_IN_STOCK_MINUTES", 60, 1) * 60
 
 MAX_REMEMBERED       = 5000  # cap on remembered alerts so memory never grows forever
 MAX_ALERTS_PER_CHECK = 5     # more than this at once = send one summary instead
@@ -148,24 +154,27 @@ def make_session() -> requests.Session:
 session = make_session()
 
 # ── State ─────────────────────────────────────────────────────────────────────
-# Alert key = sku + price, so a repriced item can trigger again
-alerted: "OrderedDict[str, bool]" = OrderedDict()
+# One record per product (name + price), whatever SKU it is listed under:
+#   {"missing_since": None or the time it was first missing from a successful check}
+# A product that stays listed never re-alerts. A product that is gone for at least
+# BACK_IN_STOCK_GAP and then reappears gets a "back in stock" alert.
+tracked: "OrderedDict[str, dict]" = OrderedDict()
 send_attempts: dict[str, int] = {}
 first_run = True
 fail_streak = 0
 running = True
 
 
-def alert_key(sku: str, price: float) -> str:
-    return hashlib.md5(f"{sku.strip().lower()}|{price:.2f}".encode()).hexdigest()
+def product_key(name: str, price: float) -> str:
+    return f"{' '.join(name.lower().split())}|{price:.2f}"
 
 
-def remember(key: str) -> None:
-    alerted[key] = True
-    alerted.move_to_end(key)
+def track(key: str) -> None:
+    tracked[key] = {"missing_since": None}
+    tracked.move_to_end(key)
     send_attempts.pop(key, None)
-    while len(alerted) > MAX_REMEMBERED:
-        alerted.popitem(last=False)
+    while len(tracked) > MAX_REMEMBERED:
+        tracked.popitem(last=False)
 
 
 def country_amount(source: dict, field: str) -> float | None:
@@ -224,16 +233,20 @@ def pushover(title: str, message: str, url: str | None = None,
     return False
 
 
-def send_notification(item: dict) -> bool:
+def send_notification(item: dict, back: bool = False) -> bool:
     price, msrp, qty = item["price"], item["msrp"], item["qty"]
     msg = f"{item['name']}\nLowest ask: ${price:.2f}"
     if msrp:
         msg += f"\nMSRP: ${msrp:,.2f} ({price / msrp * 100:.0f}% of MSRP)"
     if qty not in (None, ""):
         msg += f"\nQty: {qty}"
-    ok = pushover(f"💲 ${price:.2f} Lowest Ask on GoWholesale!", msg, item["url"])
+    if back:
+        title = f"🔁 Back in stock at ${price:.2f} on GoWholesale!"
+    else:
+        title = f"💲 ${price:.2f} Lowest Ask on GoWholesale!"
+    ok = pushover(title, msg, item["url"])
     if ok:
-        log.info(f"Pushover sent: {item['name']} @ ${price:.2f}")
+        log.info(f"Pushover sent{' (back in stock)' if back else ''}: {item['name']} @ ${price:.2f}")
     return ok
 
 
@@ -312,40 +325,56 @@ def check_once() -> None:
 
     seeding_quietly = first_run and not ALERT_ON_FIRST_RUN
     first_run = False
+    now = time.time()
 
-    matches = []
+    # Matching products in this check, one per product (duplicates collapse)
+    present: "OrderedDict[str, dict]" = OrderedDict()
     for item in listings:
-        if not is_target_price(item["price"]):
-            continue
-        key = alert_key(item["sku"], item["price"])
-        if key in alerted:
-            continue
-        if seeding_quietly:
-            remember(key)
-            log.info(f"Seeded (no alert): {item['name']} @ ${item['price']:.2f}")
-            continue
-        matches.append((key, item))
+        if is_target_price(item["price"]):
+            present.setdefault(product_key(item["name"], item["price"]), item)
 
-    if not matches:
+    # Anything we track that isn't listed right now: start its "gone" clock
+    for key, rec in tracked.items():
+        if key not in present and rec["missing_since"] is None:
+            rec["missing_since"] = now
+
+    to_send = []  # (key, item, is_back_in_stock)
+    for key, item in present.items():
+        rec = tracked.get(key)
+        if rec is None:
+            if seeding_quietly:
+                track(key)
+                log.info(f"Seeded (no alert): {item['name']} @ ${item['price']:.2f}")
+            else:
+                to_send.append((key, item, False))
+        elif rec["missing_since"] is not None:
+            gone_for = now - rec["missing_since"]
+            if gone_for >= BACK_IN_STOCK_GAP:
+                to_send.append((key, item, True))
+            else:
+                rec["missing_since"] = None  # brief blip, same listing: no alert
+        # else: still listed since last alert -> never repeat
+
+    if not to_send:
         return
 
-    if len(matches) > MAX_ALERTS_PER_CHECK:
-        lines = [f"${i['price']:.2f} | {i['name'][:60]}" for _, i in matches[:10]]
-        if pushover(f"💲 {len(matches)} price matches on GoWholesale", "\n".join(lines), NEW_LISTINGS):
-            for key, _ in matches:
-                remember(key)
-            log.info(f"Sent summary alert for {len(matches)} matches")
+    if len(to_send) > MAX_ALERTS_PER_CHECK:
+        lines = [f"${i['price']:.2f} | {'(back) ' if b else ''}{i['name'][:60]}" for _, i, b in to_send[:10]]
+        if pushover(f"💲 {len(to_send)} price matches on GoWholesale", "\n".join(lines), NEW_LISTINGS):
+            for key, _, _ in to_send:
+                track(key)
+            log.info(f"Sent summary alert for {len(to_send)} matches")
         return
 
-    for key, item in matches:
-        if send_notification(item):
-            remember(key)
+    for key, item, back in to_send:
+        if send_notification(item, back):
+            track(key)
         else:
             tries = send_attempts.get(key, 0) + 1
             send_attempts[key] = tries
             if tries >= MAX_SEND_ATTEMPTS:
                 log.error(f"Giving up on alert after {tries} tries: {item['name'][:80]}")
-                remember(key)
+                track(key)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
